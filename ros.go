@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"encoding/csv"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,7 +20,8 @@ var file string
 var routines int
 
 func main() {
-	routines = 10
+
+	routines = 1000
 	file = os.Args[1] // Netcdf file name provided by shell script
 
 	start := time.Now()
@@ -46,19 +50,27 @@ func getData(varName string) []interface{} {
 
 	defer nc.Close()
 
+	// Get lengths of lat, lon to iterate over
 	latLen := getLen(nc, "lat")
 	lonLen := getLen(nc, "lon")
 
-	vg, err := nc.GetVariable(varName)
+	vg, err := nc.GetVariable(varName) // Extract variable interface
 	handleError(err)
-	vf := vg.Values
-	vr := reflect.ValueOf(vf)
+	vf := vg.Values           // Extract values from variable interface
+	vr := reflect.ValueOf(vf) // Reflect the values to iterate over
 
-	var d []interface{}
+	ind, err := getGridIndex("../gridIndex.txt") // Indices of liard grids
+	handleError(err)
 
+	var d []interface{} // Empty interface to store 3rd dim as vector
+
+	i := 0
 	for lat := 0; lat < latLen; lat++ { // Loop across 1st dim
 		for lon := 0; lon < lonLen; lon++ { // Loop across 2nd dim
-			d = append(d, vr.Index(lat).Interface().([][]float32)[lon])
+			i++
+			if contains(ind, i) { // Proceed only if liard grid index
+				d = append(d, vr.Index(lat).Interface().([][]float32)[lon])
+			}
 		}
 	}
 	return d
@@ -86,27 +98,63 @@ func calcROS(sem chan int, sweall interface{}, rainall interface{}, snowall inte
 
 	var ros []int
 	for i := 0; i < v0.Len()-1; i++ {
-		swe := v0.Index(i).Interface().(float32)
-		sweNext := v0.Index(i + 1).Interface().(float32)
-		rain := v1.Index(i).Interface().(float32)
+		swe := v0.Index(i).Interface().(float32)         // SWE on current day
+		sweNext := v0.Index(i + 1).Interface().(float32) // SWE on next day
+		rain := v1.Index(i).Interface().(float32)        // Rain on current day
 
+		/*
+			RoS logic:
+			If SWE on ground above threshold on current day
+			If it rains above threshold on current day
+			If SWE reduces next day
+		*/
 		if swe > 10.0 && rain > 1.0 && sweNext < swe {
-			ros = append(ros, 1)
+			ros = append(ros, 1) // RoS event happened if all true
 		} else {
-			ros = append(ros, 0)
+			ros = append(ros, 0) // Not a RoS event
 		}
 	}
+
 	file, err := os.Create(f)
 	handleError(err)
 	defer file.Close()
 
 	w := csv.NewWriter(file)
 	defer w.Flush()
+
 	for i := 0; i < len(ros); i++ {
 		_, err := file.WriteString(fmt.Sprintf("%v, %v, %v, %v, %v\n", ros[i], v0.Index(i), v1.Index(i), v2.Index(i), v3.Index(i)))
 		handleError(err)
 	}
+}
 
+func getGridIndex(f string) ([]int, error) {
+	data, err := ioutil.ReadFile(f) // Read file
+	handleError(err)
+	r := strings.NewReader(string(data)) // From byte to string
+	handleError(err)
+	scanner := bufio.NewScanner(r) // Use bufio
+	scanner.Split(bufio.ScanWords)
+	var result []int
+	for scanner.Scan() {
+		x, err := strconv.Atoi(scanner.Text()) // Convert to int
+		handleError(err)
+		result = append(result, x-1)
+		/*
+			CRITICAL: x-1 because go index starts from 0
+			while index.txt was made in R with count starting from 1
+		*/
+	}
+	return result, scanner.Err()
+}
+
+func contains(ind []int, v int) bool {
+	for _, i := range ind {
+		if i == v {
+			return true
+		}
+	}
+	return false
 }
 
 func handleError(err error) {
